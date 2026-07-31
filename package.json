@@ -1,17 +1,27 @@
 {
-  "name": "mcp-remote",
-  "version": "0.1.38",
-  "description": "Remote proxy for Model Context Protocol, allowing local-only clients to connect to remote servers using oAuth",
+  "name": "@abluva/mcp-remote",
+  "version": "0.1.39",
+  "description": "MCP remote proxy with OAuth — Abluva fork with mid-session re-auth and reliable OAuth callback handling",
   "keywords": [
     "mcp",
     "stdio",
     "sse",
     "remote",
-    "oauth"
+    "oauth",
+    "abluva"
   ],
-  "author": "Glen Maddern <glen@glenmaddern.com>",
+  "author": "Abluva Research <research@abluva.com>",
   "license": "MIT",
-  "repository": "https://github.com/abluva-research/mcp-remote",
+  "homepage": "https://github.com/abluva-research/mcp-remote#readme",
+  "bugs": "https://github.com/abluva-research/mcp-remote/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abluva-research/mcp-remote.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "type": "module",
   "files": [
     "dist",
@@ -26,6 +36,7 @@
   "scripts": {
     "build": "tsup",
     "build:watch": "tsup --watch",
+    "prepack": "npm run build",
     "check": "prettier --check . && tsc",
     "lint-fix": "prettier --check . --write",
     "test:unit": "vitest run",
@@ -39,14 +50,14 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
-    "zod": "^4.0.0",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.10",
     "prettier": "^3.5.3",
     "tsup": "^8.4.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
-    "vitest": "^3.2.3"
+    "vitest": "^3.2.3",
+    "zod": "^4.0.0"
   },
   "tsup": {
     "entry": [

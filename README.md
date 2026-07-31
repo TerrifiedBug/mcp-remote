@@ -1,3 +1,35 @@
+# `@abluva/mcp-remote`
+
+Abluva-maintained fork of [`mcp-remote`](https://github.com/geelen/mcp-remote) with OAuth improvements for production MCP gateways:
+
+- Mid-session re-authentication when tokens expire or are revoked
+- Eager OAuth callback server startup (fixes `localhost` connection refused during re-auth)
+- Stale refresh-token recovery at connect time
+
+Published as **`@abluva/mcp-remote`** on npm. Upstream base: geelen/mcp-remote@0.1.38.
+
+## Quick start (Claude Desktop)
+
+```json
+{
+  "mcpServers": {
+    "remote-example": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@abluva/mcp-remote@latest",
+        "https://your-mcp-gateway.example/mcp-connect/<id>",
+        "43756"
+      ]
+    }
+  }
+}
+```
+
+The optional third argument is the OAuth callback port — use a **unique port per MCP server** (e.g. `43755`, `43756`).
+
+---
+
 # `mcp-remote`
 
 Connect an MCP Client that only supports local (stdio) servers to a Remote MCP Server, with auth support:
