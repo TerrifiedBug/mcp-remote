@@ -20,6 +20,7 @@ import {
   setupSignalHandlers,
   TransportStrategy,
   discoverOAuthServerInfo,
+  isCallbackServerListening,
 } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
@@ -76,6 +77,7 @@ async function runProxy(
     authorizationServerMetadata: discoveryResult.authorizationServerMetadata,
     protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
     wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
+    events,
   })
 
   // Create the STDIO transport for local connections
@@ -85,8 +87,11 @@ async function runProxy(
   let server: any = null
 
   // Define an auth initializer function
-  const authInitializer = async () => {
-    const authState = await authCoordinator.initializeAuth()
+  const authInitializer = async (forceReauth = false) => {
+    if (forceReauth) {
+      events.emit('reset-auth-code')
+    }
+    const authState = await authCoordinator.initializeAuth(forceReauth ? { force: true } : undefined)
 
     // Store server in outer scope for cleanup
     server = authState.server
@@ -94,8 +99,6 @@ async function runProxy(
     // If auth was completed by another instance, just log that we'll use the auth from disk
     if (authState.skipBrowserAuth) {
       log('Authentication was completed by another instance - will use tokens from disk')
-      // TODO: remove, the callback is happening before the tokens are exchanged
-      //  so we're slightly too early
       await new Promise((res) => setTimeout(res, 1_000))
     }
 
@@ -106,6 +109,20 @@ async function runProxy(
   }
 
   try {
+    // Keep the OAuth callback listener alive for the full proxy lifetime so browser
+    // redirects always hit a local server (especially during mid-session re-auth).
+    log(`Ensuring OAuth callback server is listening on port ${callbackPort}...`)
+    let initialAuthState = await authCoordinator.initializeAuth()
+    if (initialAuthState.skipBrowserAuth) {
+      log('Starting a dedicated OAuth callback server for this proxy instance')
+      initialAuthState = await authCoordinator.initializeAuth({ force: true })
+    }
+    server = initialAuthState.server
+    if (!initialAuthState.skipBrowserAuth && !(await isCallbackServerListening(callbackPort))) {
+      throw new Error(`OAuth callback server failed to start on port ${callbackPort}`)
+    }
+    log(`OAuth callback server ready on port ${callbackPort}`)
+
     // Connect to remote server with lazy authentication
     const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
 
@@ -114,6 +131,11 @@ async function runProxy(
       transportToClient: localTransport,
       transportToServer: remoteTransport,
       ignoredTools,
+      authInitializer,
+      authProvider,
+      serverUrl,
+      events,
+      callbackPort,
     })
 
     // Start the local STDIO server

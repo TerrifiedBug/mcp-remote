@@ -4,10 +4,11 @@ import { Server } from 'http'
 import express from 'express'
 import { AddressInfo } from 'net'
 import { unlinkSync } from 'fs'
-import { log, debugLog, setupOAuthCallbackServerWithLongPoll } from './utils'
+import { log, debugLog, isCallbackServerListening, setupOAuthCallbackServerWithLongPoll } from './utils'
 
 export type AuthCoordinator = {
-  initializeAuth: () => Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }>
+  initializeAuth: (options?: { force?: boolean }) => Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }>
+  resetAuth: () => Promise<void>
 }
 
 /**
@@ -136,19 +137,42 @@ export function createLazyAuthCoordinator(
 ): AuthCoordinator {
   let authState: { server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean } | null = null
 
+  const resetAuth = async () => {
+    if (authState?.server) {
+      await new Promise<void>((resolve) => authState!.server.close(() => resolve()))
+    }
+    authState = null
+    await deleteLockfile(serverUrlHash)
+  }
+
   return {
-    initializeAuth: async () => {
-      // If auth has already been initialized, return the existing state
-      if (authState) {
+    resetAuth,
+    initializeAuth: async (options?: { force?: boolean }) => {
+      if (authState && !options?.force) {
         debugLog('Auth already initialized, reusing existing state')
         return authState
+      }
+
+      if (options?.force) {
+        const canReuseExistingServer =
+          authState?.server && !authState.skipBrowserAuth && (await isCallbackServerListening(callbackPort))
+        if (canReuseExistingServer) {
+          log(`Reusing OAuth callback server on port ${callbackPort} for re-authentication`)
+          events.emit('reset-auth-code')
+          return authState
+        }
+        if (authState?.server) {
+          log(`OAuth callback server on port ${callbackPort} is not responding — recreating it`)
+          await resetAuth()
+        } else {
+          log('Starting OAuth callback server for re-authentication')
+        }
       }
 
       log('Initializing auth coordination on-demand')
       debugLog('Initializing auth coordination on-demand', { serverUrlHash, callbackPort })
 
-      // Initialize auth using the existing coordinateAuth logic
-      authState = await coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs)
+      authState = await coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs, options?.force === true)
       debugLog('Auth coordination completed', { skipBrowserAuth: authState.skipBrowserAuth })
       return authState
     },
@@ -167,14 +191,19 @@ export async function coordinateAuth(
   callbackPort: number,
   events: EventEmitter,
   authTimeoutMs: number,
+  forcePrimary = false,
 ): Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }> {
-  debugLog('Coordinating authentication', { serverUrlHash, callbackPort })
+  debugLog('Coordinating authentication', { serverUrlHash, callbackPort, forcePrimary })
 
   // Check for a lockfile (disabled on Windows for the time being)
-  const lockData = process.platform === 'win32' ? null : await checkLockfile(serverUrlHash)
+  const lockData =
+    process.platform === 'win32' || forcePrimary ? null : await checkLockfile(serverUrlHash)
 
   if (process.platform === 'win32') {
     debugLog('Skipping lockfile check on Windows')
+  } else if (forcePrimary) {
+    debugLog('Skipping lockfile check for forced re-authentication')
+    await deleteLockfile(serverUrlHash)
   } else {
     debugLog('Lockfile check result', { found: !!lockData, lockData })
   }

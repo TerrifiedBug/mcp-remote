@@ -1,4 +1,4 @@
-import { OAuthClientProvider, UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
+import { OAuthClientProvider, UnauthorizedError, auth as runMcpOAuthAuth } from '@modelcontextprotocol/sdk/client/auth.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -6,6 +6,7 @@ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { OAuthClientInformationFull, OAuthClientInformationFullSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
 import { OAuthCallbackServerOptions, StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './types'
+import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import { getConfigDir, getConfigFilePath, readJsonFile } from './mcp-auth-config'
 import {
   discoverProtectedResourceMetadata,
@@ -20,6 +21,7 @@ import crypto from 'crypto'
 import fs from 'fs'
 import { readFile, rm } from 'fs/promises'
 import path from 'path'
+import { EventEmitter } from 'events'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
 import { EnvHttpProxyAgent, fetch, Headers, RequestInit, setGlobalDispatcher } from 'undici'
 
@@ -128,17 +130,73 @@ export function createMessageTransformer({
  * Creates a bidirectional proxy between two transports
  * @param params The transport connections to proxy between
  */
+function isRecoverableAuthError(error: Error): boolean {
+  if (error instanceof UnauthorizedError) return true
+  if (error instanceof OAuthError) {
+    const msg = error.message?.toLowerCase() ?? ''
+    if (msg.includes('refresh_token') || msg.includes('invalid_token') || msg.includes('unauthorized')) {
+      return true
+    }
+    if (error.errorCode === 'invalid_request' || error.errorCode === 'invalid_token') {
+      return true
+    }
+  }
+  return error instanceof Error && error.message.toLowerCase().includes('unauthorized')
+}
+
+export async function isCallbackServerListening(port: number): Promise<boolean> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/wait-for-auth?poll=false`, {
+      signal: AbortSignal.timeout(750),
+    })
+    return response.status === 200 || response.status === 202
+  } catch {
+    return false
+  }
+}
+
+async function waitForCallbackServer(port: number, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/wait-for-auth?poll=false`, {
+        signal: AbortSignal.timeout(750),
+      })
+      if (response.status === 200 || response.status === 202) {
+        log(`OAuth callback server is ready on port ${port}`)
+        return
+      }
+    } catch {
+      // retry until timeout
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150))
+  }
+  throw new Error(`OAuth callback server is not listening on port ${port}`)
+}
+
 export function mcpProxy({
   transportToClient,
   transportToServer,
   ignoredTools = [],
+  authInitializer,
+  authProvider,
+  serverUrl,
+  events,
+  callbackPort,
 }: {
   transportToClient: Transport
-  transportToServer: Transport
+  transportToServer: Transport | SSEClientTransport | StreamableHTTPClientTransport
   ignoredTools?: string[]
+  authInitializer?: AuthInitializer
+  authProvider?: NodeOAuthClientProvider
+  serverUrl?: string
+  events?: EventEmitter
+  callbackPort?: number
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
+  let lastOutboundRequest: Message | undefined
+  let authRecoveryInFlight: Promise<void> | null = null
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -201,7 +259,8 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
-    transportToServer.send(message).catch(onServerError)
+    lastOutboundRequest = message
+    transportToServer.send(message).catch((error) => onSendError(error, message))
   }
 
   transportToServer.onmessage = (_message) => {
@@ -249,6 +308,101 @@ export function mcpProxy({
   function onServerError(error: Error) {
     log('Error from remote server:', error)
     debugLog('Error from remote server', { stack: error.stack })
+    if (isRecoverableAuthError(error)) {
+      void onSendError(error, lastOutboundRequest)
+    }
+  }
+
+  async function replyAuthErrorToClient(failedMessage: Message | undefined, message: string) {
+    if (failedMessage?.id === undefined) return
+    await transportToClient.send({
+      jsonrpc: '2.0',
+      id: failedMessage.id,
+      error: {
+        code: -32001,
+        message,
+      },
+    })
+  }
+
+  async function onSendError(error: Error, failedMessage?: Message) {
+    if (!isRecoverableAuthError(error) || !authInitializer) {
+      return
+    }
+
+    if (authRecoveryInFlight) {
+      await authRecoveryInFlight
+      if (failedMessage) {
+        try {
+          await transportToServer.send(failedMessage)
+        } catch (retryError) {
+          await replyAuthErrorToClient(
+            failedMessage,
+            retryError instanceof Error ? retryError.message : 'MCP authentication failed after re-sign-in',
+          )
+        }
+      }
+      return
+    }
+
+    authRecoveryInFlight = (async () => {
+      log('Authentication required during active session — clearing stale tokens and re-authenticating...')
+      try {
+        await authProvider?.invalidateCredentials('tokens')
+      } catch (invalidateError) {
+        debugLog('Failed to invalidate cached OAuth tokens', { invalidateError })
+      }
+      events?.emit('reset-auth-code')
+
+      debugLog('onSendError: Calling authInitializer to start auth flow')
+      const authState = await authInitializer(true)
+
+      if (!authState.skipBrowserAuth && callbackPort) {
+        await waitForCallbackServer(callbackPort)
+      }
+
+      if (!authState.skipBrowserAuth && authProvider && serverUrl) {
+        const authResult = await runMcpOAuthAuth(authProvider, { serverUrl })
+        if (authResult === 'REDIRECT') {
+          log(`Opened browser for MCP re-authentication (callback port ${callbackPort ?? 'unknown'})`)
+        }
+      } else if (authState.skipBrowserAuth) {
+        log('Authentication required but skipping browser auth - using shared auth')
+      } else {
+        log('Authentication required. Waiting for authorization...')
+      }
+
+      debugLog('onSendError: Waiting for auth code from callback server')
+      const code = await authState.waitForAuthCode()
+      debugLog('onSendError: Received auth code from callback server')
+
+      log('onSendError: Completing authorization...')
+      if ('finishAuth' in transportToServer && typeof transportToServer.finishAuth === 'function') {
+        await transportToServer.finishAuth(code)
+        log('onSendError: Authorization completed successfully')
+      } else {
+        throw new Error('Transport does not support finishAuth')
+      }
+    })()
+
+    try {
+      await authRecoveryInFlight
+      if (failedMessage) {
+        log('onSendError: Retrying failed message after re-authentication')
+        await transportToServer.send(failedMessage)
+        log('onSendError: Message successfully sent after re-authentication')
+      }
+    } catch (authError) {
+      log('onSendError: Error completing authorization:', authError)
+      await replyAuthErrorToClient(
+        failedMessage,
+        authError instanceof Error
+          ? authError.message
+          : 'MCP OAuth session expired — sign in again in your browser',
+      )
+    } finally {
+      authRecoveryInFlight = null
+    }
   }
 }
 
@@ -371,7 +525,7 @@ export async function discoverOAuthServerInfo(
 /**
  * Type for the auth initialization function
  */
-export type AuthInitializer = () => Promise<{
+export type AuthInitializer = (forceReauth?: boolean) => Promise<{
   waitForAuthCode: () => Promise<string>
   skipBrowserAuth: boolean
 }>
@@ -499,6 +653,27 @@ export async function connectToRemoteServer(
         sseTransport ? 'http-only' : 'sse-only',
         recursionReasons,
       )
+    } else if (
+      error instanceof OAuthError &&
+      (error.message?.includes('refresh_token') || error.errorCode === 'invalid_request')
+    ) {
+      log('Stale OAuth refresh token — clearing cached tokens and reconnecting...')
+      if (typeof (authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function') {
+        await authProvider.invalidateCredentials('tokens')
+      }
+      if (recursionReasons.has(REASON_AUTH_NEEDED)) {
+        throw error
+      }
+      recursionReasons.add(REASON_AUTH_NEEDED)
+      return connectToRemoteServer(
+        client,
+        serverUrl,
+        authProvider,
+        headers,
+        authInitializer,
+        transportStrategy,
+        recursionReasons,
+      )
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
       log('Authentication required. Initializing auth...')
       debugLog('Authentication error detected', {
@@ -578,6 +753,13 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     authCompletedResolve = resolve
   })
 
+  // Listen for reset-auth-code event to reset authCode to null
+  options.events.on('reset-auth-code', () => {
+    log('Resetting authCode to null due to new authorization flow')
+    debugLog('Received reset-auth-code event, resetting authCode')
+    authCode = null
+  })
+
   // Long-polling endpoint
   app.get('/wait-for-auth', (req, res) => {
     if (authCode) {
@@ -649,15 +831,24 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     log(`OAuth callback server running at http://127.0.0.1:${options.port}`)
   })
 
+  server.on('error', (error: NodeJS.ErrnoException) => {
+    if (error.code === 'EADDRINUSE') {
+      log(`Error: OAuth callback port ${options.port} is already in use by another process`)
+      log(`Use a different port in claude_desktop_config.json or stop the process using port ${options.port}`)
+    }
+  })
+
   const waitForAuthCode = (): Promise<string> => {
     return new Promise((resolve) => {
       if (authCode) {
         resolve(authCode)
+        authCode = null 
         return
       }
 
       options.events.once('auth-code-received', (code) => {
         resolve(code)
+        authCode = null 
       })
     })
   }
