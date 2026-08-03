@@ -1,12 +1,31 @@
 # `@abluva/mcp-remote`
 
-Abluva-maintained fork of [`mcp-remote`](https://github.com/geelen/mcp-remote) with OAuth improvements for production MCP gateways:
+**Abluva-maintained fork** of [`mcp-remote`](https://github.com/geelen/mcp-remote) — a stdio proxy that connects MCP clients (Claude Desktop, Cursor, etc.) to **remote MCP servers with OAuth**.
 
-- Mid-session re-authentication when tokens expire or are revoked
-- Eager OAuth callback server startup (fixes `localhost` connection refused during re-auth)
-- Stale refresh-token recovery at connect time
+Use this package when upstream `mcp-remote` hangs on auth, drops mid-session re-login, or refuses OAuth callbacks on `localhost`.
 
-Published as **`@abluva/mcp-remote`** on npm. Upstream base: geelen/mcp-remote@0.1.38.
+| | |
+|---|---|
+| **npm** | [`@abluva/mcp-remote`](https://www.npmjs.com/package/@abluva/mcp-remote) |
+| **GitHub** | [abluva-research/mcp-remote](https://github.com/abluva-research/mcp-remote) |
+| **Upstream base** | [geelen/mcp-remote](https://github.com/geelen/mcp-remote) **v0.1.38** |
+| **Also incorporates** | [jacopoc PR #213](https://github.com/geelen/mcp-remote/pull/213) (mid-session re-auth — still open upstream) |
+
+📄 **Full fork changelog, upstream issue/PR mapping, and version history:** [ABLUVA-FORK.md](./ABLUVA-FORK.md)
+
+---
+
+## Why Abluva maintains this fork
+
+Upstream `mcp-remote` is the de facto OAuth bridge for stdio-only MCP clients. Several **critical OAuth bugs remain open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/issues) — especially mid-session token expiry, Claude Desktop hangs, and `localhost` callback connection refused.
+
+`@abluva/mcp-remote` merges:
+
+- **jacopoc’s unmerged re-auth branch** ([PR #213](https://github.com/geelen/mcp-remote/pull/213))
+- **Selected open upstream PRs** ([#297](https://github.com/geelen/mcp-remote/pull/297), [#290](https://github.com/geelen/mcp-remote/pull/290), [#302](https://github.com/geelen/mcp-remote/pull/302), [#262](https://github.com/geelen/mcp-remote/pull/262) partial)
+- **Abluva production fixes** for MCP gateway OAuth (callback server lifetime, auto ports, Hub logout re-auth)
+
+---
 
 ## Quick start (Claude Desktop)
 
@@ -18,19 +37,75 @@ Published as **`@abluva/mcp-remote`** on npm. Upstream base: geelen/mcp-remote@0
       "args": [
         "-y",
         "@abluva/mcp-remote@latest",
-        "https://your-mcp-gateway.example/mcp-connect/<id>",
-        "43756"
+        "https://your-mcp-gateway.example/mcp-connect/<catalog-id>"
       ]
     }
   }
 }
 ```
 
-The optional third argument is the OAuth callback port — use a **unique port per MCP server** (e.g. `43755`, `43756`).
+- **`-y`** — required for Claude (non-interactive npx install).
+- **Callback port** — optional third argument; omitted by default (auto-selected per server URL since v0.1.40).
+- **After first install or upgrade:** `rm -rf ~/.mcp-auth` then restart Claude (Cmd+Q).
 
 ---
 
-# `mcp-remote`
+## What we fixed (summary)
+
+| Problem | Upstream refs | Fixed in |
+|---------|---------------|----------|
+| Claude **hangs** after OAuth / tool errors | [#286](https://github.com/geelen/mcp-remote/issues/286), [#293](https://github.com/geelen/mcp-remote/issues/293) | 0.1.39, 0.1.41 |
+| **`refresh_token is invalid`** at startup | [#181](https://github.com/geelen/mcp-remote/issues/181), [#91](https://github.com/geelen/mcp-remote/issues/91) | 0.1.39 |
+| Hub logout → **`localhost` connection refused** on re-auth | [#248](https://github.com/geelen/mcp-remote/issues/248), [#245](https://github.com/geelen/mcp-remote/issues/245) | 0.1.39, 0.1.42 |
+| **Port clash** with multiple MCP servers (no explicit port) | [#306](https://github.com/geelen/mcp-remote/issues/306), [#262](https://github.com/geelen/mcp-remote/pull/262) | 0.1.40, 0.1.42 |
+| Silent token expiry → browser re-auth loops | [#273](https://github.com/geelen/mcp-remote/issues/273) | 0.1.41 ([#290](https://github.com/geelen/mcp-remote/pull/290)) |
+| Token exchange to wrong URL (proxy mode) | [#270](https://github.com/geelen/mcp-remote/issues/270) | 0.1.41 ([#302](https://github.com/geelen/mcp-remote/pull/302)) |
+
+See [ABLUVA-FORK.md](./ABLUVA-FORK.md) for the complete table and version notes.
+
+---
+
+## Branches & merges
+
+```
+geelen/mcp-remote @ v0.1.38 (main)
+        │
+        ├── jacopoc/implement-reauth-after-auth-error-on-send  →  mid-session re-auth (#213)
+        │
+        └── abluva-research/mcp-remote (main)
+                ├── v0.1.39  OAuth re-auth + eager callback server
+                ├── v0.1.40  Auto callback port / EADDRINUSE recovery
+                ├── v0.1.41  #297, #290, #302
+                └── v0.1.42  Stale registration invalidation + port sync
+```
+
+---
+
+## Not yet included
+
+- **[PR #272](https://github.com/geelen/mcp-remote/pull/272)** — respond to `initialize` immediately while OAuth runs in background (Claude 60s timeout). Requires larger proxy lifecycle change; tracked for a future release.
+
+---
+
+## Local build
+
+```bash
+git clone https://github.com/abluva-research/mcp-remote.git
+cd mcp-remote
+npm install
+npm run build
+node dist/proxy.js https://your-gateway.example/mcp-connect/<id>
+```
+
+---
+
+## Upstream documentation
+
+The sections below are inherited from upstream `mcp-remote` (usage, headers, transport strategies, etc.). For Abluva-specific OAuth behaviour, prefer [ABLUVA-FORK.md](./ABLUVA-FORK.md).
+
+---
+
+# `mcp-remote` (upstream)
 
 Connect an MCP Client that only supports local (stdio) servers to a Remote MCP Server, with auth support:
 
@@ -56,7 +131,7 @@ All the most popular MCP clients (Claude Desktop, Cursor & Windsurf) use the fol
     "remote-example": {
       "command": "npx",
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse"
       ]
     }
@@ -64,114 +139,42 @@ All the most popular MCP clients (Claude Desktop, Cursor & Windsurf) use the fol
 }
 ```
 
-### Custom Headers
-
-To bypass authentication, or to emit custom headers on all requests to your remote server, pass `--header` CLI arguments:
-
-```json
-{
-  "mcpServers": {
-    "remote-example": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse",
-        "--header",
-        "Authorization: Bearer ${AUTH_TOKEN}"
-      ],
-      "env": {
-        "AUTH_TOKEN": "..."
-      }
-    },
-  }
-}
-```
-
-**Note:** Cursor and Claude Desktop (Windows) have a bug where spaces inside `args` aren't escaped when it invokes `npx`, which ends up mangling these values. You can work around it using:
-
-```jsonc
-{
-  // rest of config...
-  "args": [
-    "mcp-remote",
-    "https://remote.mcp.server/sse",
-    "--header",
-    "Authorization:${AUTH_HEADER}" // note no spaces around ':'
-  ],
-  "env": {
-    "AUTH_HEADER": "Bearer <auth-token>" // spaces OK in env vars
-  }
-},
-```
-
-### Multiple Instances
-
-To run multiple instances of the same remote server with different configurations (e.g., different Atlassian tenants), use the `--resource` flag to isolate OAuth sessions:
-
-```json
-{
-  "mcpServers": {
-    "atlassian_tenant1": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://mcp.atlassian.com/v1/sse",
-        "--resource",
-        "https://tenant1.atlassian.net/"
-      ]
-    },
-    "atlassian_tenant2": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://mcp.atlassian.com/v1/sse",
-        "--resource",
-        "https://tenant2.atlassian.net/"
-      ]
-    }
-  }
-}
-```
-
-Each unique combination of server URL, resource, and custom headers will maintain separate OAuth sessions and token storage.
-
-### Flags
-
-* If `npx` is producing errors, consider adding `-y` as the first argument to auto-accept the installation of the `mcp-remote` package.
+* If `npx` is producing errors, consider adding `-y` as the first argument to auto-accept the installation of the `@abluva/mcp-remote` package.
 
 ```json
       "command": "npx",
       "args": [
         "-y",
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse"
       ]
 ```
 
-* To force `npx` to always check for an updated version of `mcp-remote`, add the `@latest` flag:
+* To force `npx` to always check for an updated version, add the `@latest` flag:
 
 ```json
       "args": [
-        "mcp-remote@latest",
+        "-y",
+        "@abluva/mcp-remote@latest",
         "https://remote.mcp.server/sse"
       ]
 ```
 
-* To change which port `mcp-remote` listens for an OAuth redirect (by default `3334`), add an additional argument after the server URL. Note that whatever port you specify, if it is unavailable an open port will be chosen at random.
+* To change which port `@abluva/mcp-remote` listens for an OAuth redirect (by default auto-selected per server URL since v0.1.40), add an additional argument after the server URL. If the port is unavailable, an open port will be chosen at random.
 
 ```json
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse",
         "9696"
       ]
 ```
 
-* To change which host `mcp-remote` registers as the OAuth callback URL (by default `localhost`), add the `--host` flag.
+* To change which host `@abluva/mcp-remote` registers as the OAuth callback URL (by default `localhost`), add the `--host` flag.
 
 ```json
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse",
         "--host",
         "127.0.0.1"
@@ -182,7 +185,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "http://internal-service.vpc/sse",
         "--allow-http"
       ]
@@ -192,7 +195,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse",
         "--debug"
       ]
@@ -202,7 +205,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse",
         "--silent"
       ]
@@ -212,7 +215,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
     "args": [
-      "mcp-remote",
+      "@abluva/mcp-remote",
       "https://remote.mcp.server/sse",
       "--enable-proxy"
     ],
@@ -226,7 +229,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse",
         "--ignore-tool",
         "delete*",
@@ -244,7 +247,7 @@ You can specify multiple `--ignore-tool` flags to ignore different patterns. Exa
 
 ```json
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse",
         "--auth-timeout",
         "60"
@@ -258,7 +261,7 @@ MCP Remote supports different transport strategies when connecting to an MCP ser
 Specify the transport strategy with the `--transport` flag:
 
 ```bash
-npx mcp-remote https://example.remote/server --transport sse-only
+npx @abluva/mcp-remote https://example.remote/server --transport sse-only
 ```
 
 **Available Strategies:**
@@ -276,9 +279,9 @@ This is useful when connecting to OAuth servers that expect specific client/soft
 Provide the client metadata as a JSON string or as a `@` prefixed filepath with the `--static-oauth-client-metadata` flag:
 
 ```bash
-npx mcp-remote https://example.remote/server --static-oauth-client-metadata '{ "scope": "space separated scopes" }'
+npx @abluva/mcp-remote https://example.remote/server --static-oauth-client-metadata '{ "scope": "space separated scopes" }'
 # uses node readfile, so you probably want to use absolute paths if you're not sure what the cwd is
-npx mcp-remote https://example.remote/server --static-oauth-client-metadata '@/Users/username/Library/Application Support/Claude/oauth_client_metadata.json'
+npx @abluva/mcp-remote https://example.remote/server --static-oauth-client-metadata '@/Users/username/Library/Application Support/Claude/oauth_client_metadata.json'
 ```
 
 ### Static OAuth Client Information
@@ -294,9 +297,9 @@ Provide the client metadata as a JSON string or as a `@` prefixed filepath with 
 ```bash
 export MCP_REMOTE_CLIENT_ID=xxx
 export MCP_REMOTE_CLIENT_SECRET=yyy
-npx mcp-remote https://example.remote/server --static-oauth-client-info "{ \"client_id\": \"$MCP_REMOTE_CLIENT_ID\", \"client_secret\": \"$MCP_REMOTE_CLIENT_SECRET\" }"
+npx @abluva/mcp-remote https://example.remote/server --static-oauth-client-info "{ \"client_id\": \"$MCP_REMOTE_CLIENT_ID\", \"client_secret\": \"$MCP_REMOTE_CLIENT_SECRET\" }"
 # uses node readfile, so you probably want to use absolute paths if you're not sure what the cwd is
-npx mcp-remote https://example.remote/server --static-oauth-client-info '@/Users/username/Library/Application Support/Claude/oauth_client_info.json'
+npx @abluva/mcp-remote https://example.remote/server --static-oauth-client-info '@/Users/username/Library/Application Support/Claude/oauth_client_info.json'
 ```
 
 ### Claude Desktop
@@ -318,7 +321,7 @@ of the input box.
 
 [Official Docs](https://docs.cursor.com/context/model-context-protocol). The configuration file is located at `~/.cursor/mcp.json`.
 
-As of version `0.48.0`, Cursor supports unauthed SSE servers directly. If your MCP server is using the official MCP OAuth authorization protocol, you still need to add a **"command"** server and call `mcp-remote`.
+As of version `0.48.0`, Cursor supports unauthed SSE servers directly. If your MCP server is using the official MCP OAuth authorization protocol, you still need to add a **"command"** server and call `@abluva/mcp-remote`.
 
 ### Windsurf
 
@@ -345,7 +348,7 @@ Know of more resources you'd like to share? Please add them to this Readme and s
 
 ### Clear your `~/.mcp-auth` directory
 
-`mcp-remote` stores all the credential information inside `~/.mcp-auth` (or wherever your `MCP_REMOTE_CONFIG_DIR` points to). If you're having persistent issues, try running:
+`@abluva/mcp-remote` stores all the credential information inside `~/.mcp-auth` (or wherever your `MCP_REMOTE_CONFIG_DIR` points to). If you're having persistent issues, try running:
 
 ```sh
 rm -rf ~/.mcp-auth
@@ -376,7 +379,7 @@ this might look like:
     "remote-example": {
       "command": "npx",
       "args": [
-        "mcp-remote",
+        "@abluva/mcp-remote",
         "https://remote.mcp.server/sse"
       ],
       "env": {
@@ -402,7 +405,7 @@ For troubleshooting complex issues, especially with token refreshing or authenti
 
 ```json
 "args": [
-  "mcp-remote",
+  "@abluva/mcp-remote",
   "https://remote.mcp.server/sse",
   "--debug"
 ]
@@ -426,7 +429,7 @@ You can run `rm -rf ~/.mcp-auth` to clear any locally stored state and tokens.
 Run the following on the command line (not from an MCP server):
 
 ```shell
-npx -p mcp-remote@latest mcp-remote-client https://remote.mcp.server/sse
+npx -p @abluva/mcp-remote@latest mcp-remote-client https://remote.mcp.server/sse
 ```
 
 This will run through the entire authorization flow and attempt to list the tools & resources at the remote URL. Try this after running `rm -rf ~/.mcp-auth` to see if stale credentials are your problem, otherwise hopefully the issue will be more obvious in these logs than those in your MCP client.

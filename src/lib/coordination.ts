@@ -4,10 +4,22 @@ import { Server } from 'http'
 import express from 'express'
 import { AddressInfo } from 'net'
 import { unlinkSync } from 'fs'
-import { log, debugLog, isCallbackServerListening, setupOAuthCallbackServerWithLongPoll } from './utils'
+import {
+  log,
+  debugLog,
+  findExistingClientPort,
+  invalidateOAuthClientRegistration,
+  isCallbackServerListening,
+  setupOAuthCallbackServerWithLongPoll,
+} from './utils'
 
 export type AuthCoordinator = {
-  initializeAuth: (options?: { force?: boolean }) => Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }>
+  initializeAuth: (options?: { force?: boolean }) => Promise<{
+    server: Server
+    waitForAuthCode: () => Promise<string>
+    skipBrowserAuth: boolean
+    callbackPort: number
+  }>
   resetAuth: () => Promise<void>
 }
 
@@ -135,7 +147,12 @@ export function createLazyAuthCoordinator(
   events: EventEmitter,
   authTimeoutMs: number,
 ): AuthCoordinator {
-  let authState: { server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean } | null = null
+  let authState: {
+    server: Server
+    waitForAuthCode: () => Promise<string>
+    skipBrowserAuth: boolean
+    callbackPort: number
+  } | null = null
 
   const resetAuth = async () => {
     if (authState?.server) {
@@ -155,9 +172,11 @@ export function createLazyAuthCoordinator(
 
       if (options?.force) {
         const canReuseExistingServer =
-          authState?.server && !authState.skipBrowserAuth && (await isCallbackServerListening(callbackPort))
+          authState?.server &&
+          !authState.skipBrowserAuth &&
+          (await isCallbackServerListening(authState.callbackPort))
         if (canReuseExistingServer) {
-          log(`Reusing OAuth callback server on port ${callbackPort} for re-authentication`)
+          log(`Reusing OAuth callback server on port ${authState.callbackPort} for re-authentication`)
           events.emit('reset-auth-code')
           return authState
         }
@@ -192,7 +211,7 @@ export async function coordinateAuth(
   events: EventEmitter,
   authTimeoutMs: number,
   forcePrimary = false,
-): Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }> {
+): Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean; callbackPort: number }> {
   debugLog('Coordinating authentication', { serverUrlHash, callbackPort, forcePrimary })
 
   // Check for a lockfile (disabled on Windows for the time being)
@@ -236,6 +255,7 @@ export async function coordinateAuth(
           server: dummyServer,
           waitForAuthCode: dummyWaitForAuthCode,
           skipBrowserAuth: true,
+          callbackPort: dummyPort,
         }
       } else {
         log('Taking over authentication process...')
@@ -256,25 +276,28 @@ export async function coordinateAuth(
 
   // Create our own lockfile
   debugLog('Setting up OAuth callback server', { port: callbackPort })
-  const { server, waitForAuthCode, authCompletedPromise } = setupOAuthCallbackServerWithLongPoll({
+  const { server, waitForAuthCode, authCompletedPromise, port: actualPort } = await setupOAuthCallbackServerWithLongPoll({
     port: callbackPort,
     path: '/oauth/callback',
     events,
     authTimeoutMs,
   })
 
-  // Get the actual port the server is running on
-  let address = server.address() as AddressInfo | null
-  if (!address) {
-    await new Promise<void>((resolve) => server.once('listening', resolve))
-    address = server.address() as AddressInfo | null
+  if (actualPort !== callbackPort) {
+    await invalidateOAuthClientRegistration(
+      serverUrlHash,
+      `callback listener bound to ${actualPort} instead of ${callbackPort}`,
+    )
+  } else {
+    const registeredPort = await findExistingClientPort(serverUrlHash)
+    if (registeredPort && registeredPort !== actualPort) {
+      await invalidateOAuthClientRegistration(
+        serverUrlHash,
+        `registered redirect port ${registeredPort} does not match listener ${actualPort}`,
+      )
+    }
   }
 
-  if (!address) {
-    throw new Error('Failed to get server address after listening event')
-  }
-
-  const actualPort = address.port
   debugLog('OAuth callback server running', { port: actualPort })
 
   log(`Creating lockfile for server ${serverUrlHash} with process ${process.pid} on port ${actualPort}`)
@@ -313,5 +336,6 @@ export async function coordinateAuth(
     server,
     waitForAuthCode,
     skipBrowserAuth: false,
+    callbackPort: actualPort,
   }
 }

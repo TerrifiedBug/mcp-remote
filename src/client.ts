@@ -109,6 +109,7 @@ async function runClient(
     return {
       waitForAuthCode: authState.waitForAuthCode,
       skipBrowserAuth: authState.skipBrowserAuth,
+      callbackPort: authState.callbackPort,
     }
   }
 

@@ -21,6 +21,7 @@ import {
   TransportStrategy,
   discoverOAuthServerInfo,
   isCallbackServerListening,
+  waitForCallbackServer,
 } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
@@ -49,7 +50,6 @@ async function runProxy(
   const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
-  // This probes the MCP server for WWW-Authenticate header and fetches PRM
   log('Discovering OAuth server configuration...')
   const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)
 
@@ -64,10 +64,22 @@ async function runProxy(
     debugLog('No Protected Resource Metadata found, using server URL as authorization server')
   }
 
-  // Create the OAuth client provider with discovered server info
+  // Claude Desktop may spawn duplicate processes — always run our own callback server.
+  log(`Ensuring OAuth callback server is listening...`)
+  let initialAuthState = await authCoordinator.initializeAuth({ force: true })
+
+  let effectiveCallbackPort = initialAuthState.callbackPort
+  if (!initialAuthState.skipBrowserAuth) {
+    await waitForCallbackServer(effectiveCallbackPort)
+  }
+  if (!initialAuthState.skipBrowserAuth && !(await isCallbackServerListening(effectiveCallbackPort))) {
+    throw new Error(`OAuth callback server failed to start on port ${effectiveCallbackPort}`)
+  }
+  log(`OAuth callback server ready on port ${effectiveCallbackPort}`)
+
   const authProvider = new NodeOAuthClientProvider({
     serverUrl: discoveryResult.authorizationServerUrl,
-    callbackPort,
+    callbackPort: effectiveCallbackPort,
     host,
     clientName: 'MCP CLI Proxy',
     staticOAuthClientMetadata,
@@ -84,7 +96,7 @@ async function runProxy(
   const localTransport = new StdioServerTransport()
 
   // Keep track of the server instance for cleanup
-  let server: any = null
+  let server: any = initialAuthState.server
 
   // Define an auth initializer function
   const authInitializer = async (forceReauth = false) => {
@@ -93,10 +105,10 @@ async function runProxy(
     }
     const authState = await authCoordinator.initializeAuth(forceReauth ? { force: true } : undefined)
 
-    // Store server in outer scope for cleanup
     server = authState.server
+    effectiveCallbackPort = authState.callbackPort
+    authProvider.setCallbackPort(effectiveCallbackPort)
 
-    // If auth was completed by another instance, just log that we'll use the auth from disk
     if (authState.skipBrowserAuth) {
       log('Authentication was completed by another instance - will use tokens from disk')
       await new Promise((res) => setTimeout(res, 1_000))
@@ -105,28 +117,13 @@ async function runProxy(
     return {
       waitForAuthCode: authState.waitForAuthCode,
       skipBrowserAuth: authState.skipBrowserAuth,
+      callbackPort: effectiveCallbackPort,
     }
   }
 
   try {
-    // Keep the OAuth callback listener alive for the full proxy lifetime so browser
-    // redirects always hit a local server (especially during mid-session re-auth).
-    log(`Ensuring OAuth callback server is listening on port ${callbackPort}...`)
-    let initialAuthState = await authCoordinator.initializeAuth()
-    if (initialAuthState.skipBrowserAuth) {
-      log('Starting a dedicated OAuth callback server for this proxy instance')
-      initialAuthState = await authCoordinator.initializeAuth({ force: true })
-    }
-    server = initialAuthState.server
-    if (!initialAuthState.skipBrowserAuth && !(await isCallbackServerListening(callbackPort))) {
-      throw new Error(`OAuth callback server failed to start on port ${callbackPort}`)
-    }
-    log(`OAuth callback server ready on port ${callbackPort}`)
-
-    // Connect to remote server with lazy authentication
     const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
 
-    // Set up bidirectional proxy between local and remote transports
     mcpProxy({
       transportToClient: localTransport,
       transportToServer: remoteTransport,
@@ -135,20 +132,17 @@ async function runProxy(
       authProvider,
       serverUrl,
       events,
-      callbackPort,
+      callbackPort: effectiveCallbackPort,
     })
 
-    // Start the local STDIO server
     await localTransport.start()
     log('Local STDIO server running')
     log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`)
     log('Press Ctrl+C to exit')
 
-    // Setup cleanup handler
     const cleanup = async () => {
       await remoteTransport.close()
       await localTransport.close()
-      // Only close the server if it was initialized
       if (server) {
         server.close()
       }
@@ -178,7 +172,6 @@ to the CA certificate file. If using claude_desktop_config.json, this might look
 }
         `)
     }
-    // Only close the server if it was initialized
     if (server) {
       server.close()
     }
@@ -186,7 +179,6 @@ to the CA certificate file. If using claude_desktop_config.json, this might look
   }
 }
 
-// Parse command-line arguments and run the proxy
 parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://server-url> [callback-port] [--debug]')
   .then(
     ({

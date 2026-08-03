@@ -16,6 +16,7 @@ import {
 } from './protected-resource-metadata'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import express from 'express'
+import { Server } from 'http'
 import net from 'net'
 import crypto from 'crypto'
 import fs from 'fs'
@@ -155,7 +156,7 @@ export async function isCallbackServerListening(port: number): Promise<boolean> 
   }
 }
 
-async function waitForCallbackServer(port: number, timeoutMs = 8000): Promise<void> {
+export async function waitForCallbackServer(port: number, timeoutMs = 8000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {
@@ -197,6 +198,10 @@ export function mcpProxy({
   let transportToServerClosed = false
   let lastOutboundRequest: Message | undefined
   let authRecoveryInFlight: Promise<void> | null = null
+
+  // Track in-flight request ids so transport-level onerror (e.g. SSE 429) can unblock
+  // waiting clients with JSON-RPC errors instead of hanging indefinitely.
+  const pendingRequests = new Map<string | number, true>()
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -260,7 +265,33 @@ export function mcpProxy({
     }
 
     lastOutboundRequest = message
-    transportToServer.send(message).catch((error) => onSendError(error, message))
+    const requestId = 'id' in message ? message.id : undefined
+    if (requestId !== undefined) {
+      pendingRequests.set(requestId, true)
+    }
+
+    transportToServer.send(message).catch((error: Error) => {
+      if (requestId !== undefined) {
+        pendingRequests.delete(requestId)
+      }
+      if (isRecoverableAuthError(error) && authInitializer) {
+        void onSendError(error, message)
+        return
+      }
+      onServerError(error)
+      if (requestId !== undefined) {
+        transportToClient
+          .send({
+            jsonrpc: '2.0',
+            id: requestId,
+            error: {
+              code: -32603,
+              message: error.message ?? 'Internal error forwarding request to remote server',
+            },
+          })
+          .catch(onClientError)
+      }
+    })
   }
 
   transportToServer.onmessage = (_message) => {
@@ -274,6 +305,10 @@ export function mcpProxy({
       result: message.result ? 'result-present' : undefined,
       error: message.error,
     })
+
+    if (message.id !== undefined && message.id !== null) {
+      pendingRequests.delete(message.id as string | number)
+    }
 
     transportToClient.send(message).catch(onClientError)
   }
@@ -305,12 +340,34 @@ export function mcpProxy({
     debugLog('Error from local client', { stack: error.stack })
   }
 
+  function drainPendingRequests(error: Error) {
+    if (pendingRequests.size === 0) {
+      return
+    }
+    const errorMsg = error.message ?? 'Remote server error'
+    for (const id of pendingRequests.keys()) {
+      transportToClient
+        .send({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32603,
+            message: errorMsg,
+          },
+        })
+        .catch(onClientError)
+    }
+    pendingRequests.clear()
+  }
+
   function onServerError(error: Error) {
     log('Error from remote server:', error)
     debugLog('Error from remote server', { stack: error.stack })
-    if (isRecoverableAuthError(error)) {
+    if (isRecoverableAuthError(error) && authInitializer) {
       void onSendError(error, lastOutboundRequest)
+      return
     }
+    drainPendingRequests(error)
   }
 
   async function replyAuthErrorToClient(failedMessage: Message | undefined, message: string) {
@@ -528,6 +585,7 @@ export async function discoverOAuthServerInfo(
 export type AuthInitializer = (forceReauth?: boolean) => Promise<{
   waitForAuthCode: () => Promise<string>
   skipBrowserAuth: boolean
+  callbackPort: number
 }>
 
 /**
@@ -590,6 +648,10 @@ export async function connectToRemoteServer(
         requestInit: { headers },
       })
 
+  // In proxy mode the 401 challenge is received by the one-off test transport, not `transport`.
+  // finishAuth must run on the transport that stored resource_metadata (#270).
+  let authChallengeTransport: SSEClientTransport | StreamableHTTPClientTransport | undefined
+
   try {
     debugLog('Attempting to connect to remote server', { sseTransport })
 
@@ -606,6 +668,7 @@ export async function connectToRemoteServer(
         // out if we're actually talking to an HTTP server or not.
         debugLog('Creating test transport for HTTP-only connection test')
         const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
+        authChallengeTransport = testTransport
         const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
         await testClient.connect(testTransport)
       }
@@ -684,7 +747,11 @@ export async function connectToRemoteServer(
 
       // Initialize authentication on-demand
       debugLog('Calling authInitializer to start auth flow')
-      const { waitForAuthCode, skipBrowserAuth } = await authInitializer()
+      const { waitForAuthCode, skipBrowserAuth, callbackPort: authCallbackPort } = await authInitializer()
+
+      if (!skipBrowserAuth && authCallbackPort > 0) {
+        await waitForCallbackServer(authCallbackPort)
+      }
 
       if (skipBrowserAuth) {
         log('Authentication required but skipping browser auth - using shared auth')
@@ -699,7 +766,7 @@ export async function connectToRemoteServer(
 
       try {
         log('Completing authorization...')
-        await transport.finishAuth(code)
+        await (authChallengeTransport ?? transport).finishAuth(code)
         debugLog('Authorization completed successfully')
 
         if (recursionReasons.has(REASON_AUTH_NEEDED)) {
@@ -743,7 +810,7 @@ export async function connectToRemoteServer(
  * @param options The server options
  * @returns An object with the server, authCode, and waitForAuthCode function
  */
-export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServerOptions) {
+export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServerOptions) {
   let authCode: string | null = null
   const app = express()
 
@@ -827,16 +894,7 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     options.events.emit('auth-code-received', code)
   })
 
-  const server = app.listen(options.port, '127.0.0.1', () => {
-    log(`OAuth callback server running at http://127.0.0.1:${options.port}`)
-  })
-
-  server.on('error', (error: NodeJS.ErrnoException) => {
-    if (error.code === 'EADDRINUSE') {
-      log(`Error: OAuth callback port ${options.port} is already in use by another process`)
-      log(`Use a different port in claude_desktop_config.json or stop the process using port ${options.port}`)
-    }
-  })
+  const { server, port } = await bindExpressServer(app, options.port)
 
   const waitForAuthCode = (): Promise<string> => {
     return new Promise((resolve) => {
@@ -853,7 +911,7 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     })
   }
 
-  return { server, authCode, waitForAuthCode, authCompletedPromise }
+  return { server, authCode, waitForAuthCode, authCompletedPromise, port }
 }
 
 /**
@@ -861,12 +919,12 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
  * @param options The server options
  * @returns An object with the server, authCode, and waitForAuthCode function
  */
-export function setupOAuthCallbackServer(options: OAuthCallbackServerOptions) {
-  const { server, authCode, waitForAuthCode } = setupOAuthCallbackServerWithLongPoll(options)
-  return { server, authCode, waitForAuthCode }
+export async function setupOAuthCallbackServer(options: OAuthCallbackServerOptions) {
+  const { server, authCode, waitForAuthCode, port } = await setupOAuthCallbackServerWithLongPoll(options)
+  return { server, authCode, waitForAuthCode, port }
 }
 
-async function findExistingClientPort(serverUrlHash: string): Promise<number | undefined> {
+export async function findExistingClientPort(serverUrlHash: string): Promise<number | undefined> {
   const clientInfo = await readJsonFile<OAuthClientInformationFull>(serverUrlHash, 'client_info.json', OAuthClientInformationFullSchema)
   if (!clientInfo) {
     return undefined
@@ -883,10 +941,94 @@ async function findExistingClientPort(serverUrlHash: string): Promise<number | u
 }
 
 function calculateDefaultPort(serverUrlHash: string): number {
-  // Convert the first 4 bytes of the serverUrlHash into a port offset
-  const offset = parseInt(serverUrlHash.substring(0, 4), 16)
-  // Pick a consistent but random-seeming port from 3335 to 49151
-  return 3335 + (offset % 45816)
+  let hash = 0
+  for (let i = 0; i < serverUrlHash.length; i++) {
+    hash = (hash * 31 + serverUrlHash.charCodeAt(i)) >>> 0
+  }
+  return 3335 + (hash % 45816)
+}
+
+async function canBindPort(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.createServer()
+    probe.once('error', () => resolve(false))
+    probe.once('listening', () => probe.close(() => resolve(true)))
+    probe.listen(port, '127.0.0.1')
+  })
+}
+
+export async function invalidateOAuthClientRegistration(serverUrlHash: string, reason: string): Promise<void> {
+  try {
+    await rm(getConfigFilePath(serverUrlHash, 'client_info.json'))
+    log(`Cleared cached OAuth client registration (${reason})`)
+  } catch {
+    // no cached registration
+  }
+}
+
+async function resolveCallbackPort(serverUrlHash: string, specifiedPort?: number): Promise<number> {
+  const defaultPort = calculateDefaultPort(serverUrlHash)
+  const [existingClientPort, availablePort] = await Promise.all([
+    findExistingClientPort(serverUrlHash),
+    findAvailablePort(defaultPort),
+  ])
+
+  let candidate: number
+  if (specifiedPort) {
+    if (existingClientPort && specifiedPort !== existingClientPort) {
+      await invalidateOAuthClientRegistration(
+        serverUrlHash,
+        `callback port changed from ${existingClientPort} to ${specifiedPort}`,
+      )
+    }
+    candidate = specifiedPort
+  } else if (existingClientPort) {
+    candidate = existingClientPort
+  } else {
+    candidate = availablePort
+  }
+
+  if (await canBindPort(candidate)) {
+    return candidate
+  }
+
+  const replacement = await findAvailablePort(0)
+  log(`OAuth callback port ${candidate} is unavailable — using ${replacement} instead`)
+  await invalidateOAuthClientRegistration(
+    serverUrlHash,
+    `callback port moved from ${candidate} to ${replacement}`,
+  )
+  return replacement
+}
+
+async function bindExpressServer(app: express.Application, preferredPort: number): Promise<{ server: Server; port: number }> {
+  let port = preferredPort
+
+  for (let attempt = 0; attempt < 30; attempt++) {
+    try {
+      const server = await new Promise<Server>((resolve, reject) => {
+        const listener = app.listen(port, '127.0.0.1')
+        listener.once('listening', () => resolve(listener))
+        listener.once('error', reject)
+      })
+
+      if (port !== preferredPort) {
+        log(`OAuth callback port ${preferredPort} was in use — listening on ${port} instead`)
+      } else {
+        log(`OAuth callback server running at http://127.0.0.1:${port}`)
+      }
+
+      return { server, port }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+        port = await findAvailablePort(0)
+        continue
+      }
+      throw error
+    }
+  }
+
+  throw new Error('Failed to bind OAuth callback server after multiple attempts')
 }
 
 /**
@@ -1078,27 +1220,11 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
 
   debugLog(`Starting mcp-remote with server URL: ${serverUrl}`)
 
-  const defaultPort = calculateDefaultPort(serverUrlHash)
-
-  // Use the specified port, or the existing client port or fallback to find an available one
-  const [existingClientPort, availablePort] = await Promise.all([findExistingClientPort(serverUrlHash), findAvailablePort(defaultPort)])
-  let callbackPort: number
-
+  const callbackPort = await resolveCallbackPort(serverUrlHash, specifiedPort)
   if (specifiedPort) {
-    if (existingClientPort && specifiedPort !== existingClientPort) {
-      log(
-        `Warning! Specified callback port of ${specifiedPort}, which conflicts with existing client registration port ${existingClientPort}. Deleting existing client data to force reregistration.`,
-      )
-      await rm(getConfigFilePath(serverUrlHash, 'client_info.json'))
-    }
-    log(`Using specified callback port: ${specifiedPort}`)
-    callbackPort = specifiedPort
-  } else if (existingClientPort) {
-    log(`Using existing client port: ${existingClientPort}`)
-    callbackPort = existingClientPort
+    log(`Using specified callback port: ${callbackPort}`)
   } else {
-    log(`Using automatically selected callback port: ${availablePort}`)
-    callbackPort = availablePort
+    log(`Using automatically selected callback port: ${callbackPort}`)
   }
 
   if (Object.keys(headers).length > 0) {
