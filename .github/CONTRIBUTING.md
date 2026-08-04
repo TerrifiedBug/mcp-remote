@@ -61,4 +61,4 @@ Please include:
 
 ## Code of Conduct
 
-This project follows the [Code of Conduct]([./CODE_OF_CONDUCT.md](https://github.com/abluva/mcp-remote/blob/main/.github/CODE_OF_CONDUCT.md)). By participating, you agree to uphold it.
+This project follows the [Code of Conduct](https://github.com/abluva/mcp-remote/blob/main/.github/CODE_OF_CONDUCT.md). By participating, you agree to uphold it.
