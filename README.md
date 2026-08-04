@@ -1,5 +1,9 @@
 # `@abluva/mcp-remote`
 
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13951/badge)](https://www.bestpractices.dev/projects/13951) ![CodeQL](https://github.com/abluva/mcp-remote/actions/workflows/codeql.yml/badge.svg)
+![License](https://img.shields.io/github/license/abluva/mcp-remote)
+![npm version](https://img.shields.io/npm/v/@abluva/mcp-remote)
+
 **Abluva-maintained fork** of [`mcp-remote`](https://github.com/geelen/mcp-remote) — a stdio proxy that connects MCP clients (Claude Desktop, Cursor, etc.) to **remote MCP servers with OAuth**.
 
 Use this package when upstream `mcp-remote` hangs on auth, drops mid-session re-login, or refuses OAuth callbacks on `localhost`.
