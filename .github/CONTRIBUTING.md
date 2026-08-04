@@ -42,13 +42,35 @@ node dist/proxy.js https://your-gateway.example/mcp-connect/<id> --debug
 - Use clear, descriptive commit messages (imperative mood, e.g. "Fix token refresh race condition").
 - Reference related issues/PRs where relevant (e.g. `Fixes #123`, `Relates to geelen/mcp-remote#297`).
 
+## Adding a changeset
+
+If your change is user-facing (bug fix, new feature, breaking change), add a changeset before opening your PR:
+
+```bash
+npx changeset
+```
+
+This will prompt you for:
+- **Bump type** — `patch` (bug fix), `minor` (new feature, backwards compatible), or `major` (breaking change)
+- **Summary** — a one-line description of the change, written as it should appear in `CHANGELOG.md`
+
+This creates a small markdown file in `.changeset/`. Commit it as part of your PR:
+
+```bash
+git add .changeset/
+git commit -m "Add changeset"
+```
+
+Skip this step only for changes with no user-facing impact (e.g. internal docs, CI config, typo fixes in comments).
+
 ## Submitting a pull request
 
 1. Fork the repo and create your branch from `main`.
 2. Make your changes, with tests where applicable.
 3. Ensure `npm run build` and `npm test` pass locally.
-4. Fill out the PR template completely (see below).
-5. Open the PR against `main`.
+4. Add a changeset (see above) if the change is user-facing.
+5. Fill out the PR template completely.
+6. Open the PR against `main`.
 
 ## Reporting bugs
 
