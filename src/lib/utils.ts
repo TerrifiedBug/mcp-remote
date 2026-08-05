@@ -133,6 +133,7 @@ export function createMessageTransformer({
  */
 function isRecoverableAuthError(error: Error): boolean {
   if (error instanceof UnauthorizedError) return true
+  if (error instanceof StreamableHTTPError && error.code === 401) return true
   if (error instanceof OAuthError) {
     const msg = error.message?.toLowerCase() ?? ''
     if (msg.includes('refresh_token') || msg.includes('invalid_token') || msg.includes('unauthorized')) {
@@ -142,7 +143,15 @@ function isRecoverableAuthError(error: Error): boolean {
       return true
     }
   }
-  return error instanceof Error && error.message.toLowerCase().includes('unauthorized')
+  const msg = error.message?.toLowerCase() ?? ''
+  return msg.includes('unauthorized') || msg.includes('401 after successful authentication')
+}
+
+function resetTransportAuthState(transport: Transport): void {
+  const t = transport as StreamableHTTPClientTransport & { _hasCompletedAuthFlow?: boolean }
+  if (t && '_hasCompletedAuthFlow' in t) {
+    t._hasCompletedAuthFlow = false
+  }
 }
 
 export async function isCallbackServerListening(port: number): Promise<boolean> {
@@ -434,6 +443,7 @@ export function mcpProxy({
       debugLog('onSendError: Received auth code from callback server')
 
       log('onSendError: Completing authorization...')
+      resetTransportAuthState(transportToServer)
       if ('finishAuth' in transportToServer && typeof transportToServer.finishAuth === 'function') {
         await transportToServer.finishAuth(code)
         log('onSendError: Authorization completed successfully')
@@ -444,6 +454,7 @@ export function mcpProxy({
 
     try {
       await authRecoveryInFlight
+      resetTransportAuthState(transportToServer)
       if (failedMessage) {
         log('onSendError: Retrying failed message after re-authentication')
         await transportToServer.send(failedMessage)
