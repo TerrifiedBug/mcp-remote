@@ -73,6 +73,8 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | **Auto callback ports** | Per-URL port hashing, bind retry on `EADDRINUSE`, invalidate stale `client_info` when port changes | 0.1.40+ |
 | **`authProvider` port sync** | `setCallbackPort()` keeps `redirect_uri` aligned with bound listener | 0.1.42+ |
 | **Dedicated startup server** | Always `initializeAuth({ force: true })` in proxy mode (Claude Desktop duplicate-process mitigation) | 0.1.42+ |
+| **MCP 2026-07-28 stateless** | `--protocol auto\|legacy\|2026-07-28`; POST-only remote transport; stdio bridge shims for Claude | 2.0.0+ |
+| **Local dev OAuth skip** | Skip OAuth callback server for `http://127.0.0.1` / `localhost` MCP URLs | 2.0.0+ |
 | **npm packaging** | Scoped package `@abluva/mcp-remote`, `prepack` build, public publishConfig | 0.1.39+ |
 
 ---
@@ -85,6 +87,7 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | **0.1.40** | Auto OAuth callback port selection; bind retry; reduce need for explicit ports in Claude config |
 | **0.1.41** | Upstream-aligned: #297, #290, #302; regression tests for proxy-mode `finishAuth` |
 | **0.1.42** | Stronger auto-port + stale registration invalidation; always-on callback server; `setCallbackPort` sync |
+| **2.0.0** | MCP `2026-07-28` stateless remote transport; stdio bridge (initialize shim, `_meta` strip, list-method shims); `--protocol` CLI; localhost OAuth skip; SDK 1.30 |
 
 ---
 

@@ -1,7 +1,7 @@
 {
   "name": "@abluva/mcp-remote",
-  "version": "0.1.44",
-  "description": "MCP remote proxy with OAuth — Abluva fork with mid-session re-auth and reliable OAuth callback handling",
+  "version": "2.0.0",
+  "description": "MCP remote proxy with OAuth — Abluva fork with mid-session re-auth, reliable OAuth callback handling, and MCP 2026-07-28 stateless support",
   "keywords": [
     "mcp",
     "stdio",
@@ -43,6 +43,7 @@
     "test:unit:watch": "vitest"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "express": "^4.21.2",
     "open": "^10.1.0",
     "strict-url-sanitise": "^0.0.1",
@@ -50,7 +51,6 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.3",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.10",
     "prettier": "^3.5.3",

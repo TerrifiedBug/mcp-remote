@@ -419,6 +419,24 @@ describe('Feature: Command Line Arguments Parsing', () => {
     consoleSpy.mockRestore()
   })
 
+  it('Scenario: Parse --protocol before server URL (Claude Desktop flag order)', async () => {
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const args = [
+      '--protocol',
+      '2026-07-28',
+      '--allow-http',
+      'http://127.0.0.1:8095/mcp/v2',
+    ]
+    const usage = 'test usage'
+
+    const result = await parseCommandLineArgs(args, usage)
+
+    expect(result.serverUrl).toBe('http://127.0.0.1:8095/mcp/v2')
+    expect(result.protocolMode).toBe('2026-07-28')
+
+    consoleSpy.mockRestore()
+  })
+
   it('Scenario: Suppresses LOG when using --silent', async () => {
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const args = ['https://example.com/sse', '--auth-timeout', '45', '--silent']

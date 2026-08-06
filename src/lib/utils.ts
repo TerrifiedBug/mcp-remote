@@ -25,6 +25,16 @@ import path from 'path'
 import { EventEmitter } from 'events'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
 import { EnvHttpProxyAgent, fetch, Headers, RequestInit, setGlobalDispatcher } from 'undici'
+import { resolveProtocolMode } from './protocol-detector.js'
+import { StatelessHTTPTransport } from './stateless-http-transport.js'
+import {
+  buildSyntheticInitializeResult,
+  DiscoverResult,
+  isNonFatalSseDisconnect,
+  PROTOCOL_2026_07_28,
+  ProtocolMode,
+  stripStatelessWireMeta,
+} from './stateless-protocol.js'
 
 // Global type declaration for typescript
 declare global {
@@ -34,6 +44,9 @@ declare global {
 // Connection constants
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
+
+export type { ProtocolMode, DiscoverResult } from './stateless-protocol.js'
+export { PROTOCOL_2026_07_28 } from './stateless-protocol.js'
 
 // Transport strategy types
 export type TransportStrategy = 'sse-only' | 'http-only' | 'sse-first' | 'http-first'
@@ -154,6 +167,15 @@ function resetTransportAuthState(transport: Transport): void {
   }
 }
 
+export function isLocalHttpServer(serverUrl: string): boolean {
+  try {
+    const url = new URL(serverUrl)
+    return (url.hostname === 'localhost' || url.hostname === '127.0.0.1') && url.protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+
 export async function isCallbackServerListening(port: number): Promise<boolean> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/wait-for-auth?poll=false`, {
@@ -184,6 +206,14 @@ export async function waitForCallbackServer(port: number, timeoutMs = 8000): Pro
   throw new Error(`OAuth callback server is not listening on port ${port}`)
 }
 
+/**
+ * Bidirectional stdio ↔ remote HTTP proxy.
+ *
+ * Legacy path (`--protocol legacy`): forwards initialize and session traffic to Streamable HTTP.
+ * Stateless path (`--protocol 2026-07-28`): remote uses POST-only v2 wire format; stdio clients
+ * (Claude, MCP Inspector legacy era) still speak 2025-11-25, so we shim initialize and optional
+ * list methods locally and strip v2 `_meta` from responses.
+ */
 export function mcpProxy({
   transportToClient,
   transportToServer,
@@ -193,15 +223,19 @@ export function mcpProxy({
   serverUrl,
   events,
   callbackPort,
+  remoteProtocolMode = 'legacy',
+  discoverResult,
 }: {
   transportToClient: Transport
-  transportToServer: Transport | SSEClientTransport | StreamableHTTPClientTransport
+  transportToServer: Transport | SSEClientTransport | StreamableHTTPClientTransport | StatelessHTTPTransport
   ignoredTools?: string[]
   authInitializer?: AuthInitializer
   authProvider?: NodeOAuthClientProvider
   serverUrl?: string
   events?: EventEmitter
   callbackPort?: number
+  remoteProtocolMode?: 'legacy' | typeof PROTOCOL_2026_07_28
+  discoverResult?: DiscoverResult
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
@@ -235,22 +269,98 @@ export function mcpProxy({
       return request
     },
     transformResponseFunction: (req: Message, res: Message) => {
-      if (req.method === 'tools/list') {
-        return {
+      let response = res
+      if (req.method === 'tools/list' && res.result?.tools) {
+        response = {
           ...res,
           result: {
-            ...res.result,
+            ...(remoteProtocolMode === PROTOCOL_2026_07_28
+              ? stripStatelessWireMeta(res.result)
+              : res.result),
             tools: res.result.tools.filter((tool: any) => shouldIncludeTool(ignoredTools, tool.name)),
           },
         }
+      } else if (remoteProtocolMode === PROTOCOL_2026_07_28 && res.result) {
+        response = {
+          ...res,
+          result: stripStatelessWireMeta(res.result),
+        }
       }
-      return res
+      return response
     },
   })
 
+  function replyLocalResult(id: string | number | undefined, result: Record<string, unknown>) {
+    if (id === undefined || id === null) return
+    transportToClient
+      .send({
+        jsonrpc: '2.0',
+        id,
+        result,
+      })
+      .catch(onClientError)
+  }
+
+  function shimEmptyListMethod(method: string, id: string | number | undefined, resultKey: string) {
+    log(`[Local shim] ${method} → empty`)
+    replyLocalResult(id, { [resultKey]: [] })
+  }
+
   transportToClient.onmessage = (_message) => {
     // TODO: fix types
-    const message = messageTransformer.interceptRequest(_message as any)
+    const raw = _message as Message
+
+    log('[Client→Local]', raw.method || raw.id)
+
+    // Stdio clients (Claude, Inspector legacy era) often call these after tools/list.
+    // Tool-only remotes typically don't implement them — answer locally to avoid -32601 hangs.
+    if (raw.method === 'prompts/list') {
+      shimEmptyListMethod('prompts/list', raw.id, 'prompts')
+      return
+    }
+    if (raw.method === 'resources/list') {
+      shimEmptyListMethod('resources/list', raw.id, 'resources')
+      return
+    }
+    if (raw.method === 'resources/templates/list') {
+      shimEmptyListMethod('resources/templates/list', raw.id, 'resourceTemplates')
+      return
+    }
+    if (raw.method === 'tasks/list') {
+      shimEmptyListMethod('tasks/list', raw.id, 'tasks')
+      return
+    }
+    if (raw.method === 'ping') {
+      log('[Local shim] ping → ok')
+      replyLocalResult(raw.id, {})
+      return
+    }
+
+    // Stateless remote: satisfy Claude's legacy stdio requests locally before forwarding.
+    if (remoteProtocolMode === PROTOCOL_2026_07_28) {
+      if (raw.method === 'initialize') {
+        const requestedVersion = raw.params?.protocolVersion
+        if (transportToServer instanceof StatelessHTTPTransport) {
+          transportToServer.updateMetaContext({
+            clientInfo: raw.params?.clientInfo ?? { name: 'mcp-remote-client', version: '0.0.0' },
+            clientCapabilities: raw.params?.capabilities ?? { tools: {} },
+          })
+        }
+        const initResult = buildSyntheticInitializeResult(discoverResult ?? {}, requestedVersion, {
+          shimForLocalClient: true,
+        })
+        log('[Local shim] Answering initialize locally for stateless remote')
+        debugLog('Synthetic initialize result', { protocolVersion: initResult.protocolVersion })
+        replyLocalResult(raw.id, initResult)
+        return
+      }
+      if (raw.method === 'notifications/initialized') {
+        log('[Local shim] Swallowing notifications/initialized')
+        return
+      }
+    }
+
+    const message = messageTransformer.interceptRequest(raw as any)
 
     // If interceptor returns MESSAGE_BLOCKED, don't forward the message
     if (isMessageBlocked(message)) {
@@ -370,6 +480,10 @@ export function mcpProxy({
   }
 
   function onServerError(error: Error) {
+    if (isNonFatalSseDisconnect(error, pendingRequests.size)) {
+      debugLog('Ignoring non-fatal SSE stream disconnect', { message: error.message })
+      return
+    }
     log('Error from remote server:', error)
     debugLog('Error from remote server', { stack: error.stack })
     if (isRecoverableAuthError(error) && authInitializer) {
@@ -618,9 +732,68 @@ export async function connectToRemoteServer(
   authInitializer: AuthInitializer,
   transportStrategy: TransportStrategy = 'http-first',
   recursionReasons: Set<string> = new Set(),
+  protocolMode: ProtocolMode = 'auto',
 ): Promise<Transport> {
   log(`[${pid}] Connecting to remote server: ${serverUrl}`)
   const url = new URL(serverUrl)
+
+  const resolvedProtocol = await resolveProtocolMode(protocolMode, serverUrl, headers, authProvider)
+  log(`Using MCP protocol mode: ${resolvedProtocol}`)
+
+  if (resolvedProtocol === PROTOCOL_2026_07_28) {
+    const transport = new StatelessHTTPTransport(url, {
+      authProvider,
+      requestInit: { headers },
+      clientInfo: { name: 'mcp-remote', version: MCP_REMOTE_VERSION },
+    })
+    let authChallengeTransport: StatelessHTTPTransport | undefined = transport
+
+    try {
+      debugLog('Starting stateless HTTP transport (2026-07-28)')
+      await transport.start()
+      log(`Connected to remote server using StatelessHTTPTransport (${PROTOCOL_2026_07_28})`)
+      return transport
+    } catch (error: any) {
+      if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
+        log('Authentication required. Initializing auth...')
+        const { waitForAuthCode, skipBrowserAuth, callbackPort: authCallbackPort } = await authInitializer()
+
+        if (!skipBrowserAuth && authCallbackPort > 0) {
+          await waitForCallbackServer(authCallbackPort)
+        }
+
+        if (!skipBrowserAuth) {
+          log('Authentication required. Waiting for authorization...')
+        }
+
+        const code = await waitForAuthCode()
+        try {
+          log('Completing authorization...')
+          await (authChallengeTransport ?? transport).finishAuth(code)
+
+          if (recursionReasons.has(REASON_AUTH_NEEDED)) {
+            throw new Error(`Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`)
+          }
+          recursionReasons.add(REASON_AUTH_NEEDED)
+          return connectToRemoteServer(
+            client,
+            serverUrl,
+            authProvider,
+            headers,
+            authInitializer,
+            transportStrategy,
+            recursionReasons,
+            PROTOCOL_2026_07_28,
+          )
+        } catch (authError: any) {
+          log('Authorization error:', authError)
+          throw authError
+        }
+      }
+      log('Connection error:', error)
+      throw error
+    }
+  }
 
   // Create transport with eventSourceInit to pass Authorization header if present
   const eventSourceInit = {
@@ -1073,6 +1246,41 @@ export async function findAvailablePort(preferredPort?: number): Promise<number>
 }
 
 /**
+ * Returns positional CLI args after removing known flags and their values.
+ */
+export function getPositionalArgs(args: string[]): string[] {
+  const booleanFlags = new Set(['--allow-http', '--debug', '--silent', '--enable-proxy'])
+  const valueFlags = new Set([
+    '--protocol',
+    '--transport',
+    '--host',
+    '--header',
+    '--static-oauth-client-metadata',
+    '--static-oauth-client-info',
+    '--resource',
+    '--ignore-tool',
+    '--auth-timeout',
+  ])
+
+  const positional: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (booleanFlags.has(arg)) {
+      continue
+    }
+    if (valueFlags.has(arg)) {
+      i++
+      continue
+    }
+    if (arg.startsWith('-')) {
+      continue
+    }
+    positional.push(arg)
+  }
+  return positional
+}
+
+/**
  * Parses command line arguments for MCP clients and proxies
  * @param args Command line arguments
  * @param usage Usage message to show on error
@@ -1098,8 +1306,6 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     i++
   }
 
-  const serverUrl = args[0]
-  const specifiedPort = args[1] ? parseInt(args[1]) : undefined
   const allowHttp = args.includes('--allow-http')
 
   // Check for debug flag
@@ -1121,6 +1327,19 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     // Use env proxy
     setGlobalDispatcher(new EnvHttpProxyAgent())
     log('HTTP proxy support enabled - using system HTTP_PROXY/HTTPS_PROXY environment variables')
+  }
+
+  // Parse protocol mode (legacy | auto | 2026-07-28)
+  let protocolMode: ProtocolMode = 'auto'
+  const protocolIndex = args.indexOf('--protocol')
+  if (protocolIndex !== -1 && protocolIndex < args.length - 1) {
+    const mode = args[protocolIndex + 1]
+    if (mode === 'legacy' || mode === 'auto' || mode === PROTOCOL_2026_07_28) {
+      protocolMode = mode
+      log(`Using MCP protocol mode: ${protocolMode}`)
+    } else {
+      log(`Warning: Ignoring invalid --protocol value: ${mode}. Use auto, legacy, or ${PROTOCOL_2026_07_28}`)
+    }
   }
 
   // Parse transport strategy
@@ -1210,6 +1429,10 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
 
+  const positional = getPositionalArgs(args)
+  const serverUrl = positional[0]
+  const specifiedPort = positional[1] ? parseInt(positional[1], 10) : undefined
+
   if (!serverUrl) {
     log(usage)
     process.exit(1)
@@ -1270,6 +1493,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     ignoredTools,
     authTimeoutMs,
     serverUrlHash,
+    protocolMode,
   }
 }
 

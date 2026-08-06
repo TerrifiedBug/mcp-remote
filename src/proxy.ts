@@ -10,6 +10,7 @@
  */
 
 import { EventEmitter } from 'events'
+import { Server } from 'http'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   connectToRemoteServer,
@@ -21,11 +22,15 @@ import {
   TransportStrategy,
   discoverOAuthServerInfo,
   isCallbackServerListening,
+  isLocalHttpServer,
   waitForCallbackServer,
+  PROTOCOL_2026_07_28,
+  type ProtocolMode,
 } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator } from './lib/coordination'
+import { StatelessHTTPTransport } from './lib/stateless-http-transport'
 
 /**
  * Main function to run the proxy
@@ -42,40 +47,71 @@ async function runProxy(
   ignoredTools: string[],
   authTimeoutMs: number,
   serverUrlHash: string,
+  protocolMode: ProtocolMode = 'auto',
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
+  // Local HTTP sandboxes (e.g. sql-sandbox) do not need OAuth; skip callback server startup.
+  const skipOAuthSetup = isLocalHttpServer(serverUrl)
 
   // Create a lazy auth coordinator
   const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
 
-  // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
-  log('Discovering OAuth server configuration...')
-  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)
+  let discoveryResult: Awaited<ReturnType<typeof discoverOAuthServerInfo>>
+  let initialAuthState: {
+    server?: Server
+    waitForAuthCode: () => Promise<string>
+    skipBrowserAuth: boolean
+    callbackPort: number
+  }
+  let effectiveCallbackPort = callbackPort
+  let server: Server | undefined
 
-  if (discoveryResult.protectedResourceMetadata) {
-    log(`Discovered authorization server: ${discoveryResult.authorizationServerUrl}`)
-    if (discoveryResult.protectedResourceMetadata.scopes_supported) {
-      debugLog('Protected Resource Metadata scopes', {
-        scopes_supported: discoveryResult.protectedResourceMetadata.scopes_supported,
-      })
+  if (skipOAuthSetup) {
+    log('Local HTTP MCP server detected — skipping OAuth callback server')
+    discoveryResult = {
+      authorizationServerUrl: serverUrl,
+      authorizationServerMetadata: undefined,
+      protectedResourceMetadata: undefined,
+      wwwAuthenticateScope: undefined,
+    }
+    initialAuthState = {
+      skipBrowserAuth: true,
+      callbackPort: 0,
+      waitForAuthCode: async () => {
+        throw new Error('OAuth is disabled for local HTTP MCP servers')
+      },
     }
   } else {
-    debugLog('No Protected Resource Metadata found, using server URL as authorization server')
-  }
+    // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
+    log('Discovering OAuth server configuration...')
+    discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)
 
-  // Claude Desktop may spawn duplicate processes — always run our own callback server.
-  log(`Ensuring OAuth callback server is listening...`)
-  let initialAuthState = await authCoordinator.initializeAuth({ force: true })
+    if (discoveryResult.protectedResourceMetadata) {
+      log(`Discovered authorization server: ${discoveryResult.authorizationServerUrl}`)
+      if (discoveryResult.protectedResourceMetadata.scopes_supported) {
+        debugLog('Protected Resource Metadata scopes', {
+          scopes_supported: discoveryResult.protectedResourceMetadata.scopes_supported,
+        })
+      }
+    } else {
+      debugLog('No Protected Resource Metadata found, using server URL as authorization server')
+    }
 
-  let effectiveCallbackPort = initialAuthState.callbackPort
-  if (!initialAuthState.skipBrowserAuth) {
-    await waitForCallbackServer(effectiveCallbackPort)
+    // Claude Desktop may spawn duplicate processes — always run our own callback server.
+    log(`Ensuring OAuth callback server is listening...`)
+    initialAuthState = await authCoordinator.initializeAuth({ force: true })
+
+    effectiveCallbackPort = initialAuthState.callbackPort
+    server = initialAuthState.server
+    if (!initialAuthState.skipBrowserAuth) {
+      await waitForCallbackServer(effectiveCallbackPort)
+    }
+    if (!initialAuthState.skipBrowserAuth && !(await isCallbackServerListening(effectiveCallbackPort))) {
+      throw new Error(`OAuth callback server failed to start on port ${effectiveCallbackPort}`)
+    }
+    log(`OAuth callback server ready on port ${effectiveCallbackPort}`)
   }
-  if (!initialAuthState.skipBrowserAuth && !(await isCallbackServerListening(effectiveCallbackPort))) {
-    throw new Error(`OAuth callback server failed to start on port ${effectiveCallbackPort}`)
-  }
-  log(`OAuth callback server ready on port ${effectiveCallbackPort}`)
 
   const authProvider = new NodeOAuthClientProvider({
     serverUrl: discoveryResult.authorizationServerUrl,
@@ -95,11 +131,16 @@ async function runProxy(
   // Create the STDIO transport for local connections
   const localTransport = new StdioServerTransport()
 
-  // Keep track of the server instance for cleanup
-  let server: any = initialAuthState.server
-
   // Define an auth initializer function
   const authInitializer = async (forceReauth = false) => {
+    if (skipOAuthSetup) {
+      return {
+        waitForAuthCode: initialAuthState.waitForAuthCode,
+        skipBrowserAuth: true,
+        callbackPort: 0,
+      }
+    }
+
     if (forceReauth) {
       events.emit('reset-auth-code')
     }
@@ -122,7 +163,22 @@ async function runProxy(
   }
 
   try {
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    const remoteTransport = await connectToRemoteServer(
+      null,
+      serverUrl,
+      authProvider,
+      headers,
+      authInitializer,
+      transportStrategy,
+      new Set(),
+      protocolMode,
+    )
+
+    const remoteProtocolMode =
+      remoteTransport instanceof StatelessHTTPTransport ? PROTOCOL_2026_07_28 : 'legacy'
+
+    const discoverResult =
+      remoteTransport instanceof StatelessHTTPTransport ? remoteTransport.discoverResult : undefined
 
     mcpProxy({
       transportToClient: localTransport,
@@ -133,6 +189,8 @@ async function runProxy(
       serverUrl,
       events,
       callbackPort: effectiveCallbackPort,
+      remoteProtocolMode,
+      discoverResult,
     })
 
     await localTransport.start()
@@ -194,6 +252,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       ignoredTools,
       authTimeoutMs,
       serverUrlHash,
+      protocolMode,
     }) => {
       return runProxy(
         serverUrl,
@@ -207,6 +266,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         ignoredTools,
         authTimeoutMs,
         serverUrlHash,
+        protocolMode,
       )
     },
   )

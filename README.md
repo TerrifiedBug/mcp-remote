@@ -48,6 +48,36 @@ Upstream `mcp-remote` is the de facto OAuth bridge for stdio-only MCP clients. S
 }
 ```
 
+**Direct stateless server (MCP `2026-07-28`, bypass gateway):**
+
+```json
+{
+  "mcpServers": {
+    "sql-sandbox-v2": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@abluva/mcp-remote@latest",
+        "--protocol",
+        "2026-07-28",
+        "--allow-http",
+        "http://127.0.0.1:8095/mcp/v2"
+      ]
+    }
+  }
+}
+```
+
+### Protocol modes (`--protocol`)
+
+| Mode | Behavior |
+|------|----------|
+| `auto` (default) | Probe remote with `server/discover`; use `2026-07-28` if supported, else legacy |
+| `legacy` | Stateful Streamable HTTP (`initialize` + session) — use for Obot/gateway URLs |
+| `2026-07-28` | Stateless POST-only transport with `_meta` injection and local `initialize` shim for Claude |
+
+---
+
 - **`-y`** — required for Claude (non-interactive npx install).
 - **Callback port** — optional third argument; omitted by default (auto-selected per server URL since v0.1.40).
 - **After first install or upgrade:** `rm -rf ~/.mcp-auth` then restart Claude (Cmd+Q).

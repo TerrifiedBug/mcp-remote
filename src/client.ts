@@ -14,16 +14,18 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { ListResourcesResultSchema, ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import {
-  parseCommandLineArgs,
-  setupSignalHandlers,
+  connectToRemoteServer,
   log,
   debugLog,
   MCP_REMOTE_VERSION,
-  connectToRemoteServer,
+  parseCommandLineArgs,
+  setupSignalHandlers,
   TransportStrategy,
   discoverOAuthServerInfo,
+  type ProtocolMode,
 } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
+import { StatelessHTTPTransport } from './lib/stateless-http-transport'
 import { createLazyAuthCoordinator } from './lib/coordination'
 
 /**
@@ -39,6 +41,7 @@ async function runClient(
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
   authTimeoutMs: number,
   serverUrlHash: string,
+  protocolMode: ProtocolMode = 'auto',
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -114,8 +117,36 @@ async function runClient(
   }
 
   try {
-    // Connect to remote server with lazy authentication
-    const transport = await connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    const transport = await connectToRemoteServer(
+      client,
+      serverUrl,
+      authProvider,
+      headers,
+      authInitializer,
+      transportStrategy,
+      new Set(),
+      protocolMode,
+    )
+
+    if (transport instanceof StatelessHTTPTransport) {
+      log('Connected using stateless transport (2026-07-28)')
+      const toolsResponse = await new Promise<unknown>((resolve, reject) => {
+        transport.onmessage = (message) => {
+          if ('id' in message && message.id === 1) {
+            resolve(message)
+          }
+        }
+        transport.onerror = reject
+        transport
+          .send({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+          .catch(reject)
+      })
+      log('Tools:', JSON.stringify(toolsResponse, null, 2))
+      await transport.close()
+      if (server) server.close()
+      process.exit(0)
+      return
+    }
 
     // Set up message and error handlers
     transport.onmessage = (message) => {
@@ -192,6 +223,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx client.ts <https://s
       staticOAuthClientInfo,
       authTimeoutMs,
       serverUrlHash,
+      protocolMode,
     }) => {
       return runClient(
         serverUrl,
@@ -203,6 +235,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx client.ts <https://s
         staticOAuthClientInfo,
         authTimeoutMs,
         serverUrlHash,
+        protocolMode,
       )
     },
   )
