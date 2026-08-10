@@ -1,3 +1,6 @@
 node_modules
 .mcp-cli
-dist
+# dist/ IS committed on this branch — see FORK.md. Installs come from a git URL and
+# `ignore-scripts=true` (standard hardening) blocks the `prepare` build, so a prebuilt
+# dist is what makes `npx git+https://…` work at all. The entra-resource-fix branch,
+# which is what gets offered upstream, keeps dist ignored.
