@@ -1,6 +1,7 @@
 import open from 'open'
 import { z } from 'zod'
 import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
+import { checkResourceAllowed } from '@modelcontextprotocol/sdk/shared/auth-utils.js'
 import {
   OAuthClientInformationFull,
   OAuthClientInformationFullSchema,
@@ -208,11 +209,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Reading OAuth tokens')
     debugLog('Token request stack trace:', new Error().stack)
 
-    const tokens = await readJsonFile<OAuthTokensWithExpiresAt>(
-      this.serverUrlHash,
-      'tokens.json',
-      OAuthTokensWithExpiresAtSchema,
-    )
+    const tokens = await readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema)
 
     if (tokens) {
       const timeLeft = tokens.expires_in || 0
@@ -276,6 +273,37 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     }
 
     await writeJsonFile(this.serverUrlHash, 'tokens.json', tokensToSave)
+  }
+
+  /**
+   * Selects the RFC 8707 resource indicator sent with token requests.
+   *
+   * The SDK defaults this to the MCP server's own URL. Some authorization servers —
+   * notably Microsoft Entra ID — require the resource indicator to identify the
+   * application the requested scopes belong to, and reject a mismatch with
+   * AADSTS9010010. Such a server cannot name a third-party host (e.g. an AWS Bedrock
+   * AgentCore runtime URL) as an identifier URI, so honour an explicit `--resource`
+   * override here. Without this, the override reaches only the authorization request
+   * and the subsequent token exchange still fails.
+   *
+   * @param defaultResource Resource derived from the MCP server URL
+   * @param configuredResource Resource advertised by protected resource metadata
+   */
+  async validateResourceURL(defaultResource: URL, configuredResource?: string): Promise<URL | undefined> {
+    if (this.authorizeResource) {
+      debugLog('Using --resource override for RFC 8707 resource indicator', { resource: this.authorizeResource })
+      return new URL(this.authorizeResource)
+    }
+
+    if (!configuredResource) {
+      return undefined
+    }
+
+    if (!checkResourceAllowed({ requestedResource: defaultResource, configuredResource })) {
+      throw new Error(`Protected resource ${configuredResource} does not match expected ${defaultResource} (or origin)`)
+    }
+
+    return new URL(configuredResource)
   }
 
   /**

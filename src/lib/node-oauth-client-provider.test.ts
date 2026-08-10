@@ -302,4 +302,41 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(clientMetadata.scope).toBe('openid email profile')
     })
   })
+
+  describe('validateResourceURL (RFC 8707 resource indicator)', () => {
+    it('should return the --resource override so token requests match the authorization request', async () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizeResource: 'api://00000000-1111-2222-3333-444444444444',
+      })
+
+      const resource = await provider.validateResourceURL(new URL('https://example.com/mcp'), 'https://example.com/mcp')
+
+      // Without the override the SDK would send the server URL, which Entra ID
+      // rejects with AADSTS9010010 when the scopes belong to an api:// resource.
+      expect(resource?.toString()).toBe('api://00000000-1111-2222-3333-444444444444')
+    })
+
+    it('should fall back to the configured resource when no override is given', async () => {
+      provider = new NodeOAuthClientProvider({ ...defaultOptions })
+
+      const resource = await provider.validateResourceURL(new URL('https://example.com/mcp'), 'https://example.com/mcp')
+
+      expect(resource?.toString()).toBe('https://example.com/mcp')
+    })
+
+    it('should return undefined when there is no override and no configured resource', async () => {
+      provider = new NodeOAuthClientProvider({ ...defaultOptions })
+
+      await expect(provider.validateResourceURL(new URL('https://example.com/mcp'), undefined)).resolves.toBeUndefined()
+    })
+
+    it('should reject a configured resource that does not cover the server URL', async () => {
+      provider = new NodeOAuthClientProvider({ ...defaultOptions })
+
+      await expect(provider.validateResourceURL(new URL('https://example.com/mcp'), 'https://elsewhere.example/mcp')).rejects.toThrow(
+        /does not match expected/,
+      )
+    })
+  })
 })
