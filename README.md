@@ -1,3 +1,9 @@
+> **This is a fork.** `@terrifiedbug/mcp-remote` = [`@abluva/mcp-remote`](https://github.com/abluva-research/mcp-remote)
+> plus one patch: an RFC 8707 resource-indicator override so MCP servers behind
+> **Microsoft Entra ID** can be reached (upstream fails the token exchange with
+> `AADSTS9010010`). See **[FORK.md](./FORK.md)** for the why, the config, and the
+> maintenance rules. Everything below is the upstream README.
+
 # `@abluva/mcp-remote`
 
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13951/badge)](https://www.bestpractices.dev/projects/13951) ![CodeQL](https://github.com/abluva/mcp-remote/actions/workflows/codeql.yml/badge.svg)
