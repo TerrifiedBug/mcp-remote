@@ -1828,7 +1828,7 @@ var NodeOAuthClientProvider = class {
         isExpired
       });
       if (isExpired && tokens.refresh_token) {
-        return { ...tokens, access_token: "" };
+        debugLog("Access token expired; returning it as-is so a 401 can drive the refresh flow");
       }
     } else {
       debugLog("Token result: Not found");

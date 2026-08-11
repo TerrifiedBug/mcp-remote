@@ -234,8 +234,17 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         isExpired,
       })
 
+      // Deliberately return an expired access token unchanged rather than blanking it to
+      // signal "needs refresh". Blanking only works for callers that omit the header when
+      // the token is empty (utils.ts, protocol-detector.ts, stateless-http-transport.ts);
+      // the SDK's StreamableHTTPClientTransport sets `Bearer ${access_token}`
+      // unconditionally, so an empty token goes out as a credential-less `Bearer`. AWS
+      // Bedrock AgentCore rejects that with 403 ("Failed to parse token") and the SDK only
+      // re-authorizes on 401, so the connection died as a fatal error every time the cached
+      // token aged out. Sending the stale token earns a 401 ("Token has expired"), which
+      // drives the SDK's normal refresh_token flow.
       if (isExpired && tokens.refresh_token) {
-        return { ...tokens, access_token: '' }
+        debugLog('Access token expired; returning it as-is so a 401 can drive the refresh flow')
       }
     } else {
       debugLog('Token result: Not found')

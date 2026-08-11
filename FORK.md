@@ -27,15 +27,38 @@ the SDK's `selectResourceURL()`, which consults the provider's optional
 `validateResourceURL()` hook — unimplemented upstream. So authorization succeeded and the
 token exchange still failed.
 
-## The patch
+## The patches
 
-`src/lib/node-oauth-client-provider.ts` — implement `validateResourceURL()` on
-`NodeOAuthClientProvider`: return the `--resource` value when given, otherwise preserve
-stock behaviour (validate the configured resource with `checkResourceAllowed`, return
-`undefined` when there is none). Tests in `node-oauth-client-provider.test.ts`.
+Both live in `src/lib/node-oauth-client-provider.ts`.
+
+### 1. Honour `--resource` in token requests (RFC 8707)
+
+Implement `validateResourceURL()` on `NodeOAuthClientProvider`: return the `--resource`
+value when given, otherwise preserve stock behaviour (validate the configured resource with
+`checkResourceAllowed`, return `undefined` when there is none). Tests in
+`node-oauth-client-provider.test.ts`.
 
 With `--resource api://<client-id>`, the authorization request, token exchange, and
 refresh all carry the same resource indicator, and Entra issues the token.
+
+### 2. Don't blank an expired access token in `tokens()`
+
+Stock behaviour returns `{ ...tokens, access_token: '' }` when the cached token is expired
+but a refresh token exists, as a "needs refresh" signal. That only works for callers that
+omit the header when the token is empty — `utils.ts`, `protocol-detector.ts` and
+`stateless-http-transport.ts` all guard with `tokens?.access_token ? … : {}`. The SDK's
+`StreamableHTTPClientTransport` does not: it sets `Bearer ${access_token}`
+unconditionally, so an empty token goes out as a credential-less `Bearer`.
+
+AgentCore rejects that with **403** `OAuth authorization failed: Failed to parse token`
+(AWS can't parse it as a bearer scheme, so it falls through to SigV4 and complains about a
+missing `Credential`/`Signature`/`SignedHeaders` — a misleading error that looks like an
+IAM misconfiguration). The SDK only re-authorizes on **401**, so the 403 surfaced as
+`Fatal error` and the proxy exited.
+
+Returning the stale token unchanged earns a **401** `Token has expired`, which drives the
+SDK's normal `refresh_token` flow. The bug only bites once the first cached token ages out
+— a fresh interactive auth masks it entirely.
 
 ## Verified
 
@@ -43,6 +66,11 @@ refresh all carry the same resource indicator, and Entra issues the token.
 authorize → consent → token exchange → `Proxy established successfully` → `tools/list`
 returned the server's tools. `npm run test:unit`: 118 passing. `tsc` error count unchanged
 from the unpatched baseline (12 pre-existing, none in the patched file).
+
+2026-08-11, patch 2, same runtime with an expired cached token: silent refresh (no consent
+tab), `initialize` → `opensearch-mcp-server 1.29.0`, `tools/list` returned 8 tools, and
+`tokens.json` was rewritten with a new access token and the refresh token retained.
+`npm run test:unit`: 118 passing.
 
 ## Client configuration
 
